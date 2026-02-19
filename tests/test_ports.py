@@ -1,6 +1,6 @@
 import pytest
 
-from src.port_scanner.cli import parse_ports
+from port_scanner.cli import parse_ports
 
 
 def test_parse_ports_default():

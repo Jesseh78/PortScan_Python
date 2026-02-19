@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-port-scanner"
+version = "0.1.0"
+description = "Educational TCP port scanner (authorized use only)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "flask>=3.0.0"
+]
+
+[project.scripts]
+portscan = "port_scanner.cli:main"
+portscan-web = "port_scanner.webapp:main"
+
