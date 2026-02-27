@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from flask import Flask, request, render_template_string
+import csv
+import json
+from io import StringIO, BytesIO
+from dataclasses import asdict
+from typing import Any, Dict, List
+
+from flask import Flask, request, render_template_string, send_file, redirect, url_for
 
 from port_scanner.cli import parse_ports, run_scan
-from port_scanner.scanner import resolve_target
+from port_scanner.scanner import resolve_target, ScanResult
 from port_scanner.services import COMMON_SERVICES
 
 app = Flask(__name__)
+
+# Guarda o último scan em memória (por simplicidade: global).
+# Para multi-usuário real, use session/redis/db.
+LAST_SCAN: Dict[str, Any] | None = None
 
 PAGE = """
 <!doctype html>
@@ -17,7 +27,8 @@ PAGE = """
   <style>
     body { font-family: Arial, sans-serif; max-width: 980px; margin: 40px auto; padding: 0 16px; }
     input { padding: 10px; width: 100%; margin: 6px 0 14px; box-sizing: border-box; }
-    button { padding: 10px 16px; cursor: pointer; }
+    button, a.btn { padding: 10px 16px; cursor: pointer; display:inline-block; text-decoration:none; border:1px solid #ccc; border-radius:8px; background:#f7f7f7; color:#000; }
+    button:hover, a.btn:hover { background:#eee; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .box { border: 1px solid #ddd; border-radius: 10px; padding: 16px; background: #fff; }
     .warn { background: #fff7e6; border: 1px solid #ffd28a; padding: 12px; border-radius: 10px; }
@@ -28,6 +39,7 @@ PAGE = """
     .muted { color: #666; font-size: 0.95em; }
     .error { color:#b00020; margin-top: 12px; }
     .pill { display:inline-block; padding: 3px 8px; border-radius: 999px; background:#f2f2f2; font-size: 0.85em; }
+    .actions { margin-top: 10px; display:flex; gap:10px; flex-wrap:wrap; }
   </style>
 </head>
 <body>
@@ -89,6 +101,11 @@ PAGE = """
         <strong>Abertas:</strong> {{ result.open_count }}
       </p>
 
+      <div class="actions">
+        <a class="btn" href="{{ url_for('download_csv') }}">Baixar CSV</a>
+        <a class="btn" href="{{ url_for('download_json') }}">Baixar JSON</a>
+      </div>
+
       {% if result.open_ports %}
         <table>
           <thead>
@@ -119,15 +136,67 @@ PAGE = """
 
 
 def _validate_inputs(timeout: float, workers: int) -> None:
-    # simples e conservador
     if timeout < 0.1 or timeout > 10:
         raise ValueError("Timeout inválido. Use um valor entre 0.1 e 10 segundos.")
     if workers < 1 or workers > 2000:
         raise ValueError("Workers inválido. Use entre 1 e 2000.")
 
 
+def _make_export_payload(target: str, ip: str, ports_list: List[int], results: List[ScanResult]) -> Dict[str, Any]:
+    """
+    Guarda payload com resultados completos (abertas e fechadas) para export.
+    """
+    rows = []
+    for r in results:
+        rows.append({
+            "target": target,
+            "ip": ip,
+            "port": r.port,
+            "service": COMMON_SERVICES.get(r.port, "Unknown"),
+            "is_open": r.is_open,
+            "banner": r.banner,
+            "error": r.error,
+        })
+
+    open_ports_ui = []
+    for r in results:
+        if r.is_open:
+            open_ports_ui.append({
+                "port": r.port,
+                "service": COMMON_SERVICES.get(r.port, "Unknown"),
+                "banner": r.banner,
+            })
+
+    return {
+        "meta": {
+            "target": target,
+            "ip": ip,
+            "scanned": len(ports_list),
+            "open_count": sum(1 for x in results if x.is_open),
+        },
+        "rows": rows,
+        "open_ports_ui": open_ports_ui,
+    }
+
+
+def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    sio = StringIO()
+    fieldnames = ["target", "ip", "port", "service", "is_open", "banner", "error"]
+    writer = csv.DictWriter(sio, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return sio.getvalue().encode("utf-8")
+
+
+def _export_json_bytes(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
+    global LAST_SCAN
+
     error = None
     result = None
 
@@ -159,21 +228,15 @@ def index():
                 banner=banner
             )
 
-            open_ports = []
-            for r in results:
-                if r.is_open:
-                    open_ports.append({
-                        "port": r.port,
-                        "service": COMMON_SERVICES.get(r.port, "Unknown"),
-                        "banner": r.banner
-                    })
+            export_payload = _make_export_payload(target, ip, ports_list, results)
+            LAST_SCAN = export_payload  # <- salva último scan em memória
 
             result = {
-                "target": target,
-                "ip": ip,
-                "scanned": len(ports_list),
-                "open_count": len(open_ports),
-                "open_ports": open_ports,
+                "target": export_payload["meta"]["target"],
+                "ip": export_payload["meta"]["ip"],
+                "scanned": export_payload["meta"]["scanned"],
+                "open_count": export_payload["meta"]["open_count"],
+                "open_ports": export_payload["open_ports_ui"],
             }
         except Exception as e:
             error = str(e)
@@ -190,8 +253,43 @@ def index():
     )
 
 
+@app.route("/download/csv", methods=["GET"])
+def download_csv():
+    if not LAST_SCAN:
+        return redirect(url_for("index"))
+
+    csv_bytes = _export_csv_bytes(LAST_SCAN["rows"])
+    bio = BytesIO(csv_bytes)
+    bio.seek(0)
+
+    filename = "portscan_results.csv"
+    return send_file(
+        bio,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+@app.route("/download/json", methods=["GET"])
+def download_json():
+    if not LAST_SCAN:
+        return redirect(url_for("index"))
+
+    payload_bytes = _export_json_bytes(LAST_SCAN)
+    bio = BytesIO(payload_bytes)
+    bio.seek(0)
+
+    filename = "portscan_results.json"
+    return send_file(
+        bio,
+        mimetype="application/json",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
 def main():
-    # Local only. If you want LAN access, change host="0.0.0.0"
     app.run(host="127.0.0.1", port=5000, debug=False)
 
 
